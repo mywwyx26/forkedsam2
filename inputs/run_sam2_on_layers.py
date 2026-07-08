@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+from pathlib import Path
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -21,7 +22,8 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 # ---------------------------------------------------------------
 # 1. Config
 # ---------------------------------------------------------------
-CHECKPOINT_PATH = "checkpoints/sam2.1_hiera_large.pt"
+SCRIPT_DIR = Path(__file__).resolve().parent
+CHECKPOINT_PATH = str(SCRIPT_DIR.parent / "checkpoints" / "sam2.1_hiera_large.pt")
 MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 # The 7 individual frames, NOT the AVG/combined image -- the masks
