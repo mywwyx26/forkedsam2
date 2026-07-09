@@ -2,7 +2,6 @@ import os
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
 from scipy import ndimage
 from scipy.signal import savgol_filter
 from skimage.segmentation import watershed
