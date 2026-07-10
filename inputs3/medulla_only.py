@@ -7,8 +7,10 @@ from skimage.measure import label, regionprops
 
 input_folder = 'C:\\Users\\megan\\flies\\sams\\forkedsam2\\inputs3\\original'
 inputs = [os.path.join(input_folder, f) for f in sorted(os.listdir(input_folder)) if f.endswith(".tif")]
-fig, axes = plt.subplots(6,len(inputs))
+output = 'medulla_masks'
+os.makedirs(output, exist_ok=True)
 
+fig, axes = plt.subplots(6,len(inputs))
 for i in range(len(inputs)):
     image = cv2.imread(inputs[i], cv2.IMREAD_UNCHANGED)
     image_8bit = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -44,5 +46,8 @@ for i in range(len(inputs)):
     final = (lbl == largest.label).astype(np.uint8)
     axes[5,i].imshow(final, cmap='gray')
     axes[5,i].axis('off')
+
+    filename = os.path.splitext(os.path.splitext(os.path.basename(inputs[i]))[0])[0]
+    np.save(os.path.join(output, f'{filename}_medulla_mask.npy'), final)
 
 plt.show()
