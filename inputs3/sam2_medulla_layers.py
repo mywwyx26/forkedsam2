@@ -172,21 +172,6 @@ def build_layer_masks(mask, percentages, theta_final, max_jump=25):
     return layer_masks_original
 
 # sam2 helpers
-def load_as_rgb(path):
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise FileNotFoundError(path)
-    if img.ndim == 2:
-        rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-    else:
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    if rgb.dtype != np.uint8:
-        norm = (rgb.astype(np.float32) - rgb.min())
-        norm = norm / max(norm.max(), 1e-8)
-        rgb = (norm * 255).astype(np.uint8)
-    return img, rgb
-
-
 def mask_array_to_sam2_input(mask_arr, logit_scale=20.0):
     m = mask_arr.astype(np.float32)
     if m.max() > 1:
