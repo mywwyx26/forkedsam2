@@ -19,16 +19,35 @@ from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 
-def sample_points_from_line(lines_label_img, label_value, num_points=100):
+def sample_points_from_line(lines_label_img, label_value, image_gray,
+                             brightness_threshold, num_points=100):
     """
     Extract `num_points` evenly-spaced (x, y) points along a single labeled
     line in a rasterized label image, ordered along the line's path (not
     raw pixel scan order) so the spread is even along the curve rather than
     clustered.
+
+    Only pixels whose brightness in `image_gray` is >= `brightness_threshold`
+    are kept as candidate points; everything below the threshold is dropped
+    before ordering/sampling.
     """
     ys, xs = np.where(lines_label_img == label_value)
     if len(xs) == 0:
         return np.empty((0, 2))
+
+    # drop any points that fall outside the bounds of image_gray
+    h, w = image_gray.shape[:2]
+    in_bounds = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+    xs, ys = xs[in_bounds], ys[in_bounds]
+    if len(xs) == 0:
+        return np.empty((0, 2))
+
+    # binarize/filter by brightness threshold
+    keep = image_gray[ys, xs] >= brightness_threshold
+    xs, ys = xs[keep], ys[keep]
+    if len(xs) == 0:
+        return np.empty((0, 2))
+
     pts = np.stack([xs, ys], axis=1).astype(np.float64)
 
     tree = cKDTree(pts)
@@ -53,16 +72,28 @@ def sample_points_from_line(lines_label_img, label_value, num_points=100):
 
 def run_sam2_on_lines(image_rgb, lines_label_img, checkpoint, model_cfg,
                        start_label=3, n_lines=30, points_per_line=100,
-                       device='cuda'):
+                       brightness_threshold=None, device='cuda'):
     """
     Run SAM2 once per interpolated line, using sampled points from that line
     as positive point prompts.
+
+    Parameters
+    ----------
+    brightness_threshold : float or None
+        Minimum pixel brightness (0-255) a point on a line must have to be
+        kept as a candidate point prompt. If None (default), it is set to
+        the mean brightness plus one standard deviation of `image_rgb`.
 
     Returns
     -------
     list of (points, mask) tuples, one per line, in line order.
     `mask` is None if the line had no pixels (e.g. fully clipped out).
     """
+    # grayscale version of the image used only for brightness filtering
+    image_gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    if brightness_threshold is None:
+        brightness_threshold = image_gray.mean() + image_gray.std()
+
     sam2_model = build_sam2(model_cfg, checkpoint, device=device)
     predictor = SAM2ImagePredictor(sam2_model)
     predictor.set_image(image_rgb)
@@ -76,7 +107,10 @@ def run_sam2_on_lines(image_rgb, lines_label_img, checkpoint, model_cfg,
     with torch.inference_mode(), autocast_ctx:
         for i in range(n_lines):
             label_value = start_label + i
-            points = sample_points_from_line(lines_label_img, label_value, points_per_line)
+            points = sample_points_from_line(
+                lines_label_img, label_value, image_gray,
+                brightness_threshold, points_per_line,
+            )
 
             if len(points) == 0:
                 results.append((points, None))
@@ -138,10 +172,15 @@ if __name__ == "__main__":
     checkpoint = str((Path(__file__).resolve().parent).parent / 'checkpoints' / 'sam2.1_hiera_large.pt')
     model_cfg = 'configs/sam2.1/sam2.1_hiera_l.yaml'
 
+    # None -> defaults to (mean + stdev) brightness of image_rgb inside
+    # run_sam2_on_lines; set to a specific value (0-255) to override.
+    brightness_threshold = None
+
     results = run_sam2_on_lines(
         image_rgb, lines_label_img,
         checkpoint=checkpoint, model_cfg=model_cfg,
         start_label=3, n_lines=30, points_per_line=10,
+        brightness_threshold=brightness_threshold,
         device='cuda',
     )
 
