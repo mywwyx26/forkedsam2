@@ -332,7 +332,7 @@ def filter_results_by_coverage(results, min_fraction=0.01, max_fraction=0.5):
     return filtered
 
 
-def plot_grid_dynamic(image_rgb, results, max_per_figure=100):
+def plot_grid_dynamic(number, image_rgb, results, max_per_figure=100):
     """
     Plot all results in a roughly-square grid sized to fit however many
     combos there are. If there are more than `max_per_figure` results,
@@ -367,7 +367,8 @@ def plot_grid_dynamic(image_rgb, results, max_per_figure=100):
             axes[k].axis('off')
 
         plt.tight_layout()
-        plt.show()
+        plt.savefig(f'outputs/{number}_results.svg')
+        #plt.show()
 
 
 def sam2_main(number, clahe_image, smoothed_data):
@@ -401,11 +402,10 @@ def sam2_main(number, clahe_image, smoothed_data):
 
     filtered_results = filter_results_by_coverage(results, min_fraction=0.01, max_fraction=0.1)
     print(f"Kept {len(filtered_results)} of {len(results)} results after coverage filter")
-    #plot_grid_dynamic(image_rgb, filtered_results)
 
     deduped_results = deduplicate_by_prior_agreement(filtered_results, iou_threshold=0.85)
     print(f"Kept {len(deduped_results)} of {len(filtered_results)} results after deduplication")
-    plot_grid_dynamic(image_rgb, deduped_results)
+    plot_grid_dynamic(number, image_rgb, deduped_results)
 
 
 if __name__ == "__main__":
