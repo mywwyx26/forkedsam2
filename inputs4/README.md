@@ -23,13 +23,21 @@ part 3: convert to a form sam2 can read
  - the lines can be either masks or multiple points, worth trying both
  - update: since some lines go out of frame, just do points
 DONE: yes this happened, still working on negative lines
+UPDATE: masks is much better than points, but negative points are helping
 
 part 4: filter out the correct masks
  - am stumped on this one.
  - i could say get rid of the ones that are 95%+ the same?
  - but that doesn't guarantee the remaining ones are right
-UNFINISHED: too low of a success rate to actually do anything
+UNFINISHED: stuck at thresholds where same shapes don't combine, but many just disappear
 
 bonus: better ui
  - implement cli
  - main file that runs everything
+DONE: main file is good enough i don't need cli
+
+up next: add columns
+ - the edges are cut off which will make the lines harder to draw
+ - they are also harder to see in general, so hard to draw midline too
+ - even if i started at the midline, i would need some algorithm to extend more lines
+ - once i figure out how to make the lines, running sam2 should be exactly the same

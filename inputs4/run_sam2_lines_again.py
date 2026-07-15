@@ -1,14 +1,22 @@
 """
 run_sam2_lines.py
 
-Run SAM2 using MASK inputs instead of point prompts. For every pair of
-lines (from the full set: original boundary line 1, the 30 interpolated
-lines, and original boundary line 2) that are at most `max_gap` positions
-apart, build a filled mask of the region between them (closing the polygon
-by connecting the two lines' endpoints directly -- no curve fitting on the
-sides), and use that filled region as a SAM2 mask prompt.
+Run SAM2 using MASK inputs plus NEGATIVE POINT prompts. For every pair of
+INTERIOR interpolated lines (i, j) at most `max_gap` positions apart, build
+a filled mask of the region between them (closing the polygon by connecting
+the two lines' endpoints directly -- no curve fitting on the sides), and
+use that filled region as a SAM2 mask prompt.
 
-No point prompts (positive or negative) are used at this stage.
+The two original boundary lines are never used as mask bounds themselves --
+they exist only to supply negative point prompts for the outermost combos,
+so every mask (including ones right at the edge of the line stack) has
+negative points surrounding it on both sides.
+
+For each combo mask, negative points come from a sample of points along the
+line immediately outside the mask on each side (which may be a boundary
+line for the outermost combos).
+
+No positive point prompts are used -- the mask_input itself is the positive prior.
 """
 
 import math
@@ -17,9 +25,9 @@ import cv2
 import torch
 import matplotlib.pyplot as plt
 from contextlib import nullcontext
+from pathlib import Path
 from skimage.morphology import skeletonize
 from scipy.spatial import cKDTree
-from pathlib import Path
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -93,20 +101,40 @@ def build_between_mask(pts_i, pts_j, shape):
     return canvas
 
 
+def sample_points_from_ordered(pts, num_points):
+    """Evenly-spaced subsample of an already-ordered point array."""
+    if len(pts) == 0:
+        return np.empty((0, 2))
+    if len(pts) <= num_points:
+        return pts
+    idx = np.linspace(0, len(pts) - 1, num_points).astype(int)
+    return pts[idx]
+
+
 def generate_all_combo_masks(boundary_mask, label_value1, label_value2,
                               lines_label_img, start_label, n_lines,
-                              shape, max_gap=10):
+                              shape, min_gap=3, max_gap=10, points_per_adjacent_line=5):
     """
-    Build a filled mask for every pair of lines (i, j) with 1 <= j - i <= max_gap,
-    across the full stack of n_lines + 2 lines (boundary1, interpolated..., boundary2).
+    Build a filled mask for every pair of INTERIOR interpolated lines (i, j)
+    with min_gap <= j - i <= max_gap, where i, j both range over 1..n_lines (the
+    interpolated lines only). The two original boundary lines (index 0 and index
+    n_lines + 1) are deliberately never used as mask bounds -- they exist only to
+    provide negative prompts for the outermost combos, so every mask is "surrounded"
+    on both sides even at the very edges of the line stack.
+
+    For each combo mask, also build a set of negative points: a sample of
+    points from the line immediately outside the mask on each side (i - 1
+    and j + 1 -- which may be a boundary line for the outermost combos).
 
     Returns
     -------
-    dict {(i, j): binary_mask}
+    combo_masks : dict {(i, j): binary_mask}
+    combo_neg_points : dict {(i, j): np.ndarray of shape (n_points, 2)}
     """
     n_total = n_lines + 2
 
-    # cache ordered points per line index so each line is only extracted once
+    # cache ordered points per line index (0..n_total-1) so each line is
+    # only extracted once, including the two boundary lines used for negatives
     line_points_cache = {
         idx: get_line_points(idx, boundary_mask, label_value1, label_value2,
                               lines_label_img, start_label, n_lines)
@@ -114,14 +142,35 @@ def generate_all_combo_masks(boundary_mask, label_value1, label_value2,
     }
 
     combo_masks = {}
-    for i in range(n_total):
-        j_max = min(i + max_gap, n_total - 1)
-        for j in range(i + 1, j_max + 1):
-            mask = build_between_mask(line_points_cache[i], line_points_cache[j], shape)
-            if mask is not None:
-                combo_masks[(i, j)] = mask
+    combo_neg_points = {}
 
-    return combo_masks
+    for i in range(1, n_lines + 1):
+        j_min = i + min_gap
+        j_max = min(i + max_gap, n_lines)
+        for j in range(j_min, j_max + 1):
+            pts_i = line_points_cache[i]
+            pts_j = line_points_cache[j]
+            mask = build_between_mask(pts_i, pts_j, shape)
+            if mask is None:
+                continue
+            combo_masks[(i, j)] = mask
+
+            neg_points_list = []
+
+            # points from the line immediately outside the mask on each side
+            left_adj_idx = i - 1
+            right_adj_idx = j + 1
+            for adj_idx in (left_adj_idx, right_adj_idx):
+                adj_pts = line_points_cache.get(adj_idx)
+                if adj_pts is not None and len(adj_pts) > 0:
+                    neg_points_list.append(sample_points_from_ordered(adj_pts, points_per_adjacent_line))
+
+            neg_points_list = [p for p in neg_points_list if len(p) > 0]
+            combo_neg_points[(i, j)] = (
+                np.concatenate(neg_points_list, axis=0) if neg_points_list else np.empty((0, 2))
+            )
+
+    return combo_masks, combo_neg_points
 
 
 def mask_to_sam2_input(binary_mask, logit_scale=15.0, low_res_size=256):
@@ -137,10 +186,11 @@ def mask_to_sam2_input(binary_mask, logit_scale=15.0, low_res_size=256):
     return logits[None, :, :].astype(np.float32)
 
 
-def run_sam2_on_combo_masks(image_rgb, combo_masks, checkpoint, model_cfg, device='cuda'):
+def run_sam2_on_combo_masks(image_rgb, combo_masks, combo_neg_points, checkpoint, model_cfg, device='cuda'):
     """
-    Run SAM2 once per combo mask, using ONLY the mask as the prompt
-    (no point or box prompts).
+    Run SAM2 once per combo mask, using the mask as the primary prompt PLUS
+    negative point prompts (from combo_neg_points) marking the adjacent
+    lines and every spanned line's endpoints as background.
 
     Returns
     -------
@@ -159,9 +209,18 @@ def run_sam2_on_combo_masks(image_rgb, combo_masks, checkpoint, model_cfg, devic
     with torch.inference_mode(), autocast_ctx:
         for (i, j), binary_mask in combo_masks.items():
             mask_input = mask_to_sam2_input(binary_mask)
+            neg_points = combo_neg_points.get((i, j), np.empty((0, 2)))
+
+            if len(neg_points) > 0:
+                point_coords = neg_points
+                point_labels = np.zeros(len(neg_points), dtype=np.int32)  # all negative
+            else:
+                point_coords = None
+                point_labels = None
+
             masks, scores, _ = predictor.predict(
-                point_coords=None,
-                point_labels=None,
+                point_coords=point_coords,
+                point_labels=point_labels,
                 mask_input=mask_input,
                 multimask_output=False,
             )
@@ -172,11 +231,95 @@ def run_sam2_on_combo_masks(image_rgb, combo_masks, checkpoint, model_cfg, devic
     return results
 
 
-def filter_results_by_coverage(results, max_fraction=0.5):
+def compute_iou(mask_a, mask_b):
+    """Intersection-over-union between two binary masks."""
+    a = np.asarray(mask_a).astype(bool)
+    b = np.asarray(mask_b).astype(bool)
+    intersection = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    if union == 0:
+        return 1.0 if intersection == 0 else 0.0
+    return intersection / union
+
+
+def deduplicate_by_prior_agreement(results, iou_threshold=0.9):
     """
-    Drop any (i, j) result whose predicted mask covers more than
-    `max_fraction` of the total image pixels -- these are almost always
-    over-segmentations rather than a real bounded strip between the lines.
+    Group predicted masks that are near-duplicates of each other (IoU above
+    `iou_threshold`), then keep only ONE result per group: whichever member's
+    predicted mask has the highest IoU against its OWN prior (input polygon)
+    mask -- i.e. whichever combo's prediction stuck closest to what was asked
+    for, rather than trusting SAM2's own confidence score.
+
+    Uses the FULL pairwise IoU matrix + union-find (connected components)
+    rather than greedy first-match clustering. This guarantees any two masks
+    with IoU >= threshold end up in the same group -- including transitively,
+    through a chain of near-duplicates -- regardless of iteration order,
+    which greedy clustering can miss or fragment.
+
+    Returns
+    -------
+    dict, same shape as `results` but with duplicates collapsed.
+    """
+    keys = sorted(results.keys())
+    n = len(keys)
+    pred_masks = [np.asarray(results[k][1]).astype(bool) for k in keys]
+
+    # full pairwise IoU matrix (n x n, symmetric, diagonal unused)
+    iou_matrix = np.zeros((n, n), dtype=np.float64)
+    for a in range(n):
+        for b in range(a + 1, n):
+            iou_val = compute_iou(pred_masks[a], pred_masks[b])
+            iou_matrix[a, b] = iou_val
+            iou_matrix[b, a] = iou_val
+
+    # union-find so IoU-linked masks merge transitively, order-independent
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for a in range(n):
+        for b in range(a + 1, n):
+            if iou_matrix[a, b] >= iou_threshold:
+                union(a, b)
+
+    clusters = {}
+    for idx in range(n):
+        root = find(idx)
+        clusters.setdefault(root, []).append(idx)
+
+    deduped = {}
+    for members in clusters.values():
+        best_idx = None
+        best_agreement = -1.0
+        for idx in members:
+            key = keys[idx]
+            prior_mask, pred_mask = results[key]
+            agreement = compute_iou(pred_mask, prior_mask)
+            if agreement > best_agreement:
+                best_agreement = agreement
+                best_idx = idx
+        best_key = keys[best_idx]
+        deduped[best_key] = results[best_key]
+
+    return deduped
+
+
+def filter_results_by_coverage(results, min_fraction=0.01, max_fraction=0.5):
+    """
+    Drop any (i, j) result whose predicted mask covers less than
+    `min_fraction` or more than `max_fraction` of the total image pixels --
+    masks below min_fraction are usually degenerate/empty-ish predictions,
+    and masks above max_fraction are almost always over-segmentations
+    rather than a real bounded strip between the lines.
     """
     filtered = {}
     for key, (prior_mask, pred_mask) in results.items():
@@ -184,7 +327,7 @@ def filter_results_by_coverage(results, max_fraction=0.5):
             continue
         pred_mask_bool = np.asarray(pred_mask).astype(bool)
         coverage = np.count_nonzero(pred_mask_bool) / pred_mask_bool.size
-        if coverage <= max_fraction:
+        if min_fraction <= coverage <= max_fraction:
             filtered[key] = (prior_mask, pred_mask)
     return filtered
 
@@ -227,32 +370,46 @@ def plot_grid_dynamic(image_rgb, results, max_per_figure=100):
         plt.show()
 
 
-if __name__ == "__main__":
-    number = '659'
-
-    clahe_image = np.load(f'C:\\Users\\megan\\flies\\sams\\forkedsam2\\inputs4\\clahe\\{number}_clahe.npy')
-    smoothed_data = np.load(f'C:\\Users\\megan\\flies\\sams\\forkedsam2\\inputs4\\bounds\\{number}.npy')  # labels 1, 2
+def sam2_main(number, clahe_image, smoothed_data):
+    # make it easier to call from main file instead of changing both places
     lines_label_img = np.load(f'lines\\{number}.npy')  # labels 3..32 (30 interpolated lines)
 
     image_uint8 = cv2.normalize(clahe_image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     image_rgb = cv2.cvtColor(image_uint8, cv2.COLOR_GRAY2RGB)
 
+    # smoothed_data / lines_label_img can legitimately be a different (larger)
+    # shape than the image, since lines are sometimes drawn outside the image
+    # bounds to get better interpolation near the edges. That's fine --
+    # generate_all_combo_masks always builds the final polygon canvas at
+    # image_shape, and cv2.fillPoly clips any out-of-bounds points naturally.
+    image_shape = image_rgb.shape[:2]
+
     checkpoint = str((Path(__file__).resolve().parent).parent / 'checkpoints' / 'sam2.1_hiera_large.pt')
     model_cfg = 'configs/sam2.1/sam2.1_hiera_l.yaml'
 
-    combo_masks = generate_all_combo_masks(
+    combo_masks, combo_neg_points = generate_all_combo_masks(
         boundary_mask=smoothed_data, label_value1=1, label_value2=2,
         lines_label_img=lines_label_img, start_label=3, n_lines=30,
-        shape=smoothed_data.shape, max_gap=10,
+        shape=image_shape, min_gap=3, max_gap=10, points_per_adjacent_line=5,
     )
     print(f"Generated {len(combo_masks)} combo masks")
 
     results = run_sam2_on_combo_masks(
-        image_rgb, combo_masks,
+        image_rgb, combo_masks, combo_neg_points,
         checkpoint=checkpoint, model_cfg=model_cfg, device='cuda',
     )
 
-    filtered_results = filter_results_by_coverage(results, max_fraction=0.2)
+    filtered_results = filter_results_by_coverage(results, min_fraction=0.01, max_fraction=0.1)
     print(f"Kept {len(filtered_results)} of {len(results)} results after coverage filter")
+    #plot_grid_dynamic(image_rgb, filtered_results)
 
-    plot_grid_dynamic(image_rgb, filtered_results)
+    deduped_results = deduplicate_by_prior_agreement(filtered_results, iou_threshold=0.85)
+    print(f"Kept {len(deduped_results)} of {len(filtered_results)} results after deduplication")
+    plot_grid_dynamic(image_rgb, deduped_results)
+
+
+if __name__ == "__main__":
+    number = '659'
+    clahe_image = np.load(f'C:\\Users\\megan\\flies\\sams\\forkedsam2\\inputs4\\clahe\\{number}_clahe.npy')
+    smoothed_data = np.load(f'C:\\Users\\megan\\flies\\sams\\forkedsam2\\inputs4\\bounds\\{number}_smoothed.npy')
+    sam2_main(number=number, clahe_image=clahe_image, smoothed_data=smoothed_data)
