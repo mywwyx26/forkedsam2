@@ -194,7 +194,7 @@ def run_sam2_on_combo_masks(image_rgb, combo_masks, combo_neg_points, checkpoint
 
     Returns
     -------
-    dict {(i, j): (prior_binary_mask, predicted_mask)}
+    dict {(i, j): (prior_binary_mask, predicted_mask, score)}
     """
     sam2_model = build_sam2(model_cfg, checkpoint, device=device)
     predictor = SAM2ImagePredictor(sam2_model)
@@ -226,7 +226,8 @@ def run_sam2_on_combo_masks(image_rgb, combo_masks, combo_neg_points, checkpoint
             )
             best_idx = int(np.argmax(scores))
             best_mask = masks[best_idx]
-            results[(i, j)] = (binary_mask, best_mask)
+            best_score = float(scores[best_idx])
+            results[(i, j)] = (binary_mask, best_mask, best_score)
 
     return results
 
@@ -242,72 +243,41 @@ def compute_iou(mask_a, mask_b):
     return intersection / union
 
 
-def deduplicate_by_prior_agreement(results, iou_threshold=0.9):
+def deduplicate_by_score(results, iou_threshold=0.9):
     """
     Group predicted masks that are near-duplicates of each other (IoU above
-    `iou_threshold`), then keep only ONE result per group: whichever member's
-    predicted mask has the highest IoU against its OWN prior (input polygon)
-    mask -- i.e. whichever combo's prediction stuck closest to what was asked
-    for, rather than trusting SAM2's own confidence score.
+    `iou_threshold`), then keep only ONE result per group: whichever member
+    has the HIGHEST SAM2 confidence score.
 
-    Uses the FULL pairwise IoU matrix + union-find (connected components)
-    rather than greedy first-match clustering. This guarantees any two masks
-    with IoU >= threshold end up in the same group -- including transitively,
-    through a chain of near-duplicates -- regardless of iteration order,
-    which greedy clustering can miss or fragment.
+    Uses GREEDY clustering: each mask joins the first existing cluster whose
+    representative (the cluster's first member) it matches closely enough,
+    otherwise it starts a new cluster. This deliberately does NOT merge
+    transitively through chains of only-moderately-similar masks the way
+    full pairwise + union-find would -- that chaining effect is what was
+    collapsing genuinely different large and small sections into a single
+    surviving cluster. Greedy keeps more distinct sections separate.
 
     Returns
     -------
     dict, same shape as `results` but with duplicates collapsed.
     """
     keys = sorted(results.keys())
-    n = len(keys)
-    pred_masks = [np.asarray(results[k][1]).astype(bool) for k in keys]
+    clusters = []  # each cluster: {'rep_mask': array, 'members': [key, ...]}
 
-    # full pairwise IoU matrix (n x n, symmetric, diagonal unused)
-    iou_matrix = np.zeros((n, n), dtype=np.float64)
-    for a in range(n):
-        for b in range(a + 1, n):
-            iou_val = compute_iou(pred_masks[a], pred_masks[b])
-            iou_matrix[a, b] = iou_val
-            iou_matrix[b, a] = iou_val
-
-    # union-find so IoU-linked masks merge transitively, order-independent
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x, y):
-        rx, ry = find(x), find(y)
-        if rx != ry:
-            parent[rx] = ry
-
-    for a in range(n):
-        for b in range(a + 1, n):
-            if iou_matrix[a, b] >= iou_threshold:
-                union(a, b)
-
-    clusters = {}
-    for idx in range(n):
-        root = find(idx)
-        clusters.setdefault(root, []).append(idx)
+    for key in keys:
+        _, pred_mask, _ = results[key]
+        assigned = False
+        for cluster in clusters:
+            if compute_iou(pred_mask, cluster['rep_mask']) >= iou_threshold:
+                cluster['members'].append(key)
+                assigned = True
+                break
+        if not assigned:
+            clusters.append({'rep_mask': pred_mask, 'members': [key]})
 
     deduped = {}
-    for members in clusters.values():
-        best_idx = None
-        best_agreement = -1.0
-        for idx in members:
-            key = keys[idx]
-            prior_mask, pred_mask = results[key]
-            agreement = compute_iou(pred_mask, prior_mask)
-            if agreement > best_agreement:
-                best_agreement = agreement
-                best_idx = idx
-        best_key = keys[best_idx]
+    for cluster in clusters:
+        best_key = max(cluster['members'], key=lambda k: results[k][2])  # highest score
         deduped[best_key] = results[best_key]
 
     return deduped
@@ -322,13 +292,13 @@ def filter_results_by_coverage(results, min_fraction=0.01, max_fraction=0.5):
     rather than a real bounded strip between the lines.
     """
     filtered = {}
-    for key, (prior_mask, pred_mask) in results.items():
+    for key, (prior_mask, pred_mask, score) in results.items():
         if pred_mask is None:
             continue
         pred_mask_bool = np.asarray(pred_mask).astype(bool)
         coverage = np.count_nonzero(pred_mask_bool) / pred_mask_bool.size
         if min_fraction <= coverage <= max_fraction:
-            filtered[key] = (prior_mask, pred_mask)
+            filtered[key] = (prior_mask, pred_mask, score)
     return filtered
 
 
@@ -336,8 +306,7 @@ def plot_grid_dynamic(number, image_rgb, results, max_per_figure=100):
     """
     Plot all results in a roughly-square grid sized to fit however many
     combos there are. If there are more than `max_per_figure` results,
-    splits across multiple figures so matplotlib doesn't choke on one huge
-    grid -- with max_gap=10 across 32 lines you'll have ~265 combos total.
+    splits across multiple figures so matplotlib doesn't choke on one grid.
     """
     items = list(results.items())
     n_figures = math.ceil(len(items) / max_per_figure)
@@ -351,14 +320,14 @@ def plot_grid_dynamic(number, image_rgb, results, max_per_figure=100):
         fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.0, rows * 2.0))
         axes = np.array(axes).reshape(-1)
 
-        for k, ((i, j), (prior_mask, pred_mask)) in enumerate(chunk):
+        for k, ((i, j), (prior_mask, pred_mask, score)) in enumerate(chunk):
             ax = axes[k]
             ax.imshow(image_rgb, cmap='gray')
             if pred_mask is not None:
                 overlay = np.ma.masked_where(pred_mask == 0, pred_mask)
                 ax.imshow(overlay, cmap='autumn', alpha=0.5)
                 coverage_pct = 100 * np.count_nonzero(pred_mask) / pred_mask.size
-                ax.set_title(f"{i}-{j} ({coverage_pct:.0f}%)", fontsize=6)
+                ax.set_title(f"{i}-{j} ({coverage_pct:.0f}%, s={score:.2f})", fontsize=6)
             else:
                 ax.set_title(f"{i}-{j}", fontsize=6)
             ax.axis('off')
@@ -367,7 +336,7 @@ def plot_grid_dynamic(number, image_rgb, results, max_per_figure=100):
             axes[k].axis('off')
 
         plt.tight_layout()
-        plt.savefig(f'outputs/{number}_results.svg')
+        plt.savefig(f'outputs2/{number}_results.svg')
         #plt.show()
 
 
@@ -403,7 +372,7 @@ def sam2_main(number, clahe_image, smoothed_data):
     filtered_results = filter_results_by_coverage(results, min_fraction=0.01, max_fraction=0.1)
     print(f"Kept {len(filtered_results)} of {len(results)} results after coverage filter")
 
-    deduped_results = deduplicate_by_prior_agreement(filtered_results, iou_threshold=0.85)
+    deduped_results = deduplicate_by_score(filtered_results, iou_threshold=0.6)
     print(f"Kept {len(deduped_results)} of {len(filtered_results)} results after deduplication")
     plot_grid_dynamic(number, image_rgb, deduped_results)
 
