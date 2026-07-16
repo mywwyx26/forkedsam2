@@ -380,5 +380,5 @@ def sam2_main(number, clahe_image, smoothed_data):
 if __name__ == "__main__":
     number = '659'
     clahe_image = np.load(f'C:\\Users\\megan\\flies\\sams\\forkedsam2\\inputs4\\clahe\\{number}_clahe.npy')
-    smoothed_data = np.load(f'C:\\Users\\megan\\flies\\sams\\forkedsam2\\inputs4\\bounds\\{number}_smoothed.npy')
+    smoothed_data = np.load(f'C:\\Users\\megan\\flies\\sams\\forkedsam2\\inputs4\\bounds\\{number}.npy')
     sam2_main(number=number, clahe_image=clahe_image, smoothed_data=smoothed_data)
