@@ -7,8 +7,6 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 from scipy.interpolate import splprep, splev
 
 def bound_lines(number, data):
-    number = '746' # change number for each file, but should find a better way to do this
-
     labels_present = np.unique(data)
     labels_present = labels_present[labels_present != 0]  # drop background
 
@@ -45,7 +43,7 @@ def bound_lines(number, data):
     return data, smoothed_data, labels_present
 
 if __name__ == "__main__":
-    number = '659' # change number for each file, do cli later
+    number = '659' # change number for each file
     clahe_image = np.load(f'C:\\Users\\megan\\flies\\sams\\forkedsam2\\inputs4\\clahe\\{number}_clahe.npy')
     data = cv2.imread(f'C:\\Users\\megan\\flies\\sams\\forkedsam2\\inputs4\\bounds\\{number}.tif', cv2.IMREAD_UNCHANGED)
     data, smoothed_data, labels_present = bound_lines(number, data) # does np.save
