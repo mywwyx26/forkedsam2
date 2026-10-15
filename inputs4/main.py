@@ -3,7 +3,6 @@
 
 import cv2
 import numpy as np
-from pathlib import Path
 
 from bound_lines import bound_lines
 from interpolate_lines import order_points_by_path, generate_intermediate_lines, rasterize_lines
